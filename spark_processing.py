@@ -1,130 +1,158 @@
 import logging
+
+from cassandra.cluster import Cluster
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType
+from pyspark.sql.types import StructType, StructField, StringType
 
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s:%(funcName)s:%(levelname)s:%(message)s')
-logger = logging.getLogger("spark_structured_streaming")
+def create_keyspace(session):
+    session.execute("""
+        CREATE KEYSPACE IF NOT EXISTS spark_streams
+        WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
+    """)
+
+    print("Keyspace created successfully!")
 
 
-def initialize_spark_session(app_name, access_key, secret_key):
-    """
-    Initialize the Spark Session with provided configurations.
-    
-    :param app_name: Name of the spark application.
-    :param access_key: Access key for S3.
-    :param secret_key: Secret key for S3.
-    :return: Spark session object or None if there's an error.
-    """
+def create_table(session):
+    session.execute("""
+    CREATE TABLE IF NOT EXISTS spark_streams.created_users (
+        id UUID PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        gender TEXT,
+        address TEXT,
+        post_code TEXT,
+        email TEXT,
+        username TEXT,
+        registered_date TEXT,
+        phone TEXT,
+        picture TEXT);
+    """)
+
+    print("Table created successfully!")
+
+
+def insert_data(session, **kwargs):
+    print("inserting data...")
+
+    user_id = kwargs.get('id')
+    first_name = kwargs.get('first_name')
+    last_name = kwargs.get('last_name')
+    gender = kwargs.get('gender')
+    address = kwargs.get('address')
+    postcode = kwargs.get('post_code')
+    email = kwargs.get('email')
+    username = kwargs.get('username')
+    dob = kwargs.get('dob')
+    registered_date = kwargs.get('registered_date')
+    phone = kwargs.get('phone')
+    picture = kwargs.get('picture')
+
     try:
-        spark = SparkSession \
-                .builder \
-                .appName(app_name) \
-                .config("spark.hadoop.fs.s3a.access.key", access_key) \
-                .config("spark.hadoop.fs.s3a.secret.key", secret_key) \
-                .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-                .getOrCreate()
-
-        spark.sparkContext.setLogLevel("ERROR")
-        logger.info('Spark session initialized successfully')
-        return spark
+        session.execute("""
+            INSERT INTO spark_streams.created_users(id, first_name, last_name, gender, address, 
+                post_code, email, username, dob, registered_date, phone, picture)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, first_name, last_name, gender, address,
+              postcode, email, username, dob, registered_date, phone, picture))
+        logging.info(f"Data inserted for {first_name} {last_name}")
 
     except Exception as e:
-        logger.error(f"Spark session initialization failed. Error: {e}")
-        return None
+        logging.error(f'could not insert data due to {e}')
 
 
-def get_streaming_dataframe(spark, brokers, topic):
-    """
-    Get a streaming dataframe from Kafka.
-    
-    :param spark: Initialized Spark session.
-    :param brokers: Comma-separated list of Kafka brokers.
-    :param topic: Kafka topic to subscribe to.
-    :return: Dataframe object or None if there's an error.
-    """
+def create_spark_connection():
+    s_conn = None
+
     try:
-        df = spark \
-            .readStream \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", brokers) \
-            .option("subscribe", topic) \
-            .option("delimiter", ",") \
-            .option("startingOffsets", "earliest") \
+        s_conn = SparkSession.builder \
+            .appName('SparkDataStreaming') \
+            .config('spark.jars.packages', "com.datastax.spark:spark-cassandra-connector_2.13:3.4.1,"
+                                           "org.apache.spark:spark-sql-kafka-0-10_2.13:3.4.1") \
+            .config('spark.cassandra.connection.host', 'localhost') \
+            .getOrCreate()
+
+        s_conn.sparkContext.setLogLevel("ERROR")
+        logging.info("Spark connection created successfully!")
+    except Exception as e:
+        logging.error(f"Couldn't create the spark session due to exception {e}")
+
+    return s_conn
+
+
+def connect_to_kafka(spark_conn):
+    spark_df = None
+    try:
+        spark_df = spark_conn.readStream \
+            .format('kafka') \
+            .option('kafka.bootstrap.servers', 'localhost:9092') \
+            .option('subscribe', 'users_created') \
+            .option('startingOffsets', 'earliest') \
             .load()
-        logger.info("Streaming dataframe fetched successfully")
-        return df
-
+        logging.info("kafka dataframe created successfully")
     except Exception as e:
-        logger.warning(f"Failed to fetch streaming dataframe. Error: {e}")
+        logging.warning(f"kafka dataframe could not be created because: {e}")
+
+    return spark_df
+
+
+def create_cassandra_connection():
+    try:
+        # connecting to the cassandra cluster
+        cluster = Cluster(['localhost'])
+
+        cas_session = cluster.connect()
+
+        return cas_session
+    except Exception as e:
+        logging.error(f"Could not create cassandra connection due to {e}")
         return None
 
 
-def transform_streaming_data(df):
-    """
-    Transform the initial dataframe to get the final structure.
-    
-    :param df: Initial dataframe with raw data.
-    :return: Transformed dataframe.
-    """
+def create_selection_df_from_kafka(spark_df):
     schema = StructType([
-        StructField("full_name", StringType(), False),
+        StructField("id", StringType(), False),
+        StructField("first_name", StringType(), False),
+        StructField("last_name", StringType(), False),
         StructField("gender", StringType(), False),
-        StructField("location", StringType(), False),
-        StructField("city", StringType(), False),
-        StructField("country", StringType(), False),
-        StructField("postcode", IntegerType(), False),
-        StructField("latitude", FloatType(), False),
-        StructField("longitude", FloatType(), False),
-        StructField("email", StringType(), False)
+        StructField("address", StringType(), False),
+        StructField("post_code", StringType(), False),
+        StructField("email", StringType(), False),
+        StructField("username", StringType(), False),
+        StructField("registered_date", StringType(), False),
+        StructField("phone", StringType(), False),
+        StructField("picture", StringType(), False)
     ])
 
-    transformed_df = df.selectExpr("CAST(value AS STRING)") \
-        .select(from_json(col("value"), schema).alias("data")) \
-        .select("data.*")
-    return transformed_df
+    sel = spark_df.selectExpr("CAST(value AS STRING)") \
+        .select(from_json(col('value'), schema).alias('data')).select("data.*")
+    print(sel)
+
+    return sel
 
 
-def initiate_streaming_to_bucket(df, path, checkpoint_location):
-    """
-    Start streaming the transformed data to the specified S3 bucket in parquet format.
-    
-    :param df: Transformed dataframe.
-    :param path: S3 bucket path.
-    :param checkpoint_location: Checkpoint location for streaming.
-    :return: None
-    """
-    logger.info("Initiating streaming process...")
-    stream_query = (df.writeStream
-                    .format("parquet")
-                    .outputMode("append")
-                    .option("path", path)
-                    .option("checkpointLocation", checkpoint_location)
-                    .start())
-    stream_query.awaitTermination()
+if __name__ == "__main__":
+    # create spark connection
+    spark_conn = create_spark_connection()
 
+    if spark_conn is not None:
+        # connect to kafka with spark connection
+        spark_df = connect_to_kafka(spark_conn)
+        selection_df = create_selection_df_from_kafka(spark_df)
+        session = create_cassandra_connection()
 
-def main():
-    app_name = "SparkStructuredStreamingToS3"
-    access_key = "ENTER_YOUR_ACCESS_KEY"
-    secret_key = "ENTER_YOUR_SECRET_KEY"
-    brokers = "kafka_broker_1:19092,kafka_broker_2:19093,kafka_broker_3:19094"
-    topic = "names_topic"
-    path = "BUCKET_PATH"
-    checkpoint_location = "CHECKPOINT_LOCATION"
+        if session is not None:
+            create_keyspace(session)
+            create_table(session)
 
-    spark = initialize_spark_session(app_name, access_key, secret_key)
-    if spark:
-        df = get_streaming_dataframe(spark, brokers, topic)
-        if df:
-            transformed_df = transform_streaming_data(df)
-            initiate_streaming_to_bucket(transformed_df, path, checkpoint_location)
+            logging.info("Streaming is being started...")
 
+            streaming_query = (selection_df.writeStream.format("org.apache.spark.sql.cassandra")
+                               .option('checkpointLocation', '/tmp/checkpoint')
+                               .option('keyspace', 'spark_streams')
+                               .option('table', 'created_users')
+                               .start())
 
-# Execute the main function if this script is run as the main module
-if __name__ == '__main__':
-    main()
-  
+            streaming_query.awaitTermination()
